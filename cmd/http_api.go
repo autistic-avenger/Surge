@@ -195,6 +195,7 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 				return
 			}
 			globalSettings = newSettings
+			GlobalLifecycle.ApplySettings(newSettings)
 			writeJSONResponse(w,http.StatusOK,map[string]interface{}{
 				"status":"updated",
 			})
@@ -211,6 +212,7 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 		}
 
 		globalSettings = currentSettings
+		GlobalLifecycle.ApplySettings(currentSettings)
 
 		writeJSONResponse(w,http.StatusOK,map[string]interface{}{
 			"status":"reloaded",

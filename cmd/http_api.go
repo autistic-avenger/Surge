@@ -113,11 +113,7 @@ func registerHTTPRoutes(mux *http.ServeMux, port int, defaultOutputDir string, s
 		writeJSONResponse(w, http.StatusAccepted, map[string]interface{}{
 			"status": "shutting_down",
 		})
-		go func() {
-			if err := executeGlobalShutdown("API requested shutdown"); err != nil {
-        		utils.Debug("API shutdown error: %v", err)
-    		}
-		}()
+		requestGlobalShutdown("API requested shutdown")
 	}))
 
 	mux.HandleFunc("/publish",requireMethod(http.MethodPost,func(w http.ResponseWriter, r *http.Request) {

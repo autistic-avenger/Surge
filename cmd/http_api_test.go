@@ -1,21 +1,101 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/SurgeDM/Surge/internal/config"
+	"github.com/SurgeDM/Surge/internal/orchestrator"
+	"github.com/SurgeDM/Surge/internal/scheduler"
 	"github.com/SurgeDM/Surge/internal/service"
 	"github.com/SurgeDM/Surge/internal/testutil"
 	"github.com/SurgeDM/Surge/internal/types"
 )
+
+func TestPostSettingsAppliesDefaultDownloadDirToRunningLifecycle(t *testing.T) {
+	setupIsolatedCmdState(t)
+	originalSettings, originalLifecycle := globalSettings, GlobalLifecycle
+	t.Cleanup(func() {
+		globalSettings = originalSettings
+		GlobalLifecycle = originalLifecycle
+	})
+	initial := config.DefaultSettings()
+	initial.General.DefaultDownloadDir.Value = t.TempDir()
+	globalSettings = initial
+	progressCh := make(chan types.DownloadEvent, 16)
+	pool := scheduler.New(progressCh, 1)
+	eventBus := orchestrator.NewEventBus()
+	lifecycle := orchestrator.NewLifecycleManager(pool, eventBus, initial)
+	GlobalLifecycle = lifecycle
+	t.Cleanup(lifecycle.Shutdown)
+	t.Cleanup(eventBus.Shutdown)
+	localService := service.NewLocalDownloadService(lifecycle)
+
+	updatedDir := t.TempDir()
+	updated := initial.Clone()
+	updated.General.DefaultDownloadDir.Value = updatedDir
+	body, err := json.Marshal(updated)
+	if err != nil {
+		t.Fatalf("marshal settings: %v", err)
+	}
+	mux := http.NewServeMux()
+	registerHTTPRoutes(mux, 0, "", localService)
+	recorder := httptest.NewRecorder()
+	mux.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/settings", bytes.NewReader(body)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("POST /settings returned %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	const filename = "settings-updated.bin"
+	const fileSize = int64(16 * 1024)
+	downloader := testutil.NewStreamingMockServerT(t, fileSize,
+		testutil.WithFilename(filename), testutil.WithRangeSupport(true))
+	defer downloader.Close()
+	downloadBody, err := json.Marshal(map[string]string{"url": downloader.URL() + "/" + filename})
+	if err != nil {
+		t.Fatalf("marshal download request: %v", err)
+	}
+	downloadRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(downloadRecorder, httptest.NewRequest(http.MethodPost, "/download", bytes.NewReader(downloadBody)))
+	if downloadRecorder.Code != http.StatusOK {
+		t.Fatalf("POST /download returned %d: %s", downloadRecorder.Code, downloadRecorder.Body.String())
+	}
+	wantPath := filepath.Join(updatedDir, filename)
+	deadline := time.Now().Add(10 * time.Second)
+	var downloaded bool
+	for time.Now().Before(deadline) {
+		if info, err := os.Stat(wantPath); err == nil && info.Size() == fileSize {
+			downloaded = true
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !downloaded {
+		t.Fatalf("download did not complete at %s", wantPath)
+	}
+
+	lifecycle.ApplySettings(initial)
+	globalSettings = initial
+	reloadRecorder := httptest.NewRecorder()
+	mux.ServeHTTP(reloadRecorder, httptest.NewRequest(http.MethodPost, "/settings/reload", nil))
+	if reloadRecorder.Code != http.StatusOK {
+		t.Fatalf("POST /settings/reload returned %d: %s", reloadRecorder.Code, reloadRecorder.Body.String())
+	}
+	if got := config.Resolve[string](lifecycle.GetSettings().General.DefaultDownloadDir); got != updatedDir {
+		t.Fatalf("lifecycle retained default directory %q after reload, want %q", got, updatedDir)
+	}
+}
 
 type httpAPITestService struct {
 	history               []types.DownloadRecord
